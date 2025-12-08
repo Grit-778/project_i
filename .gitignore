@@ -24,7 +24,6 @@ project.xcworkspace
 
 # Android/IntelliJ
 #
-build/
 .idea
 .gradle
 local.properties
@@ -39,7 +38,9 @@ __pycache__/
 *.so
 .Python
 env/
-build/
+venv/
+
+# 构建相关（保留在Python部分，但移除非必要项）
 develop-eggs/
 dist/
 downloads/
@@ -59,28 +60,42 @@ wheels/
 #
 .ipynb_checkpoints
 
-# ML
-#
+# ML - 修改为更精确的规则
+# 只忽略大型二进制模型文件，不忽略整个models目录
 data/raw/
-*.pkl
-*.h5
-*.pt
-*.joblib
-*.onnx
+data/external/
+
+# 保留模型定义文件，只忽略训练好的大型模型
+export PYTHONPATH=$PYTHONPATH:. # 保留环境设置文件
+export PYTHONPATH=$PYTHONPATH:$PWD # 保留环境设置文件
+
+# 只忽略大型模型文件，不忽略整个models目录
+/models/*.pkl
+/models/*.h5
+/models/*.pt
+/models/*.joblib
+/models/*.onnx
+
+# 但保留模型代码文件
+!models/*.py
+!models/*/*.py
+
+# 保留数据处理后的小型数据文件
+data/processed/
 
 # Environment
 #
-env/
-venv/
 *.env
 
 # IDE
 #
 .vscode/
-.idea/
 *.sublime-project
 *.sublime-workspace
 
 # Logs
 #
 *.log
+
+# 添加 .gitkeep 文件提示（不会被忽略）
+!.gitkeep
