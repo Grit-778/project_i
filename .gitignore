@@ -62,8 +62,6 @@ wheels/
 
 # ML - 修改为更精确的规则
 # 只忽略大型二进制模型文件，不忽略整个models目录
-data/raw/
-data/external/
 
 # 保留模型定义文件，只忽略训练好的大型模型
 export PYTHONPATH=$PYTHONPATH:. # 保留环境设置文件
