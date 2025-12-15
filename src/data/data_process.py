@@ -39,156 +39,112 @@ import numpy as np
 
 
 class DataLoad:
-    # max data size per batch and data load size allowed 
     allow_data_size_one_batch = "500M"
     max_data_size = "10G"
 
     def __init__(self, data_path: str):
         self.data_path = data_path
-        self.file_size_bytes: Optional[int] = None
-        self.file_type: Optional[str] = None   # csv / xlsx / tsv / other
 
-    # --------- 工具方法 ---------
     @staticmethod
     def _parse_size_str(size_str: str) -> int:
-        """
-        把 '500M' / '10G' 之类的转成byte
-        """
         size_str = size_str.strip().upper()
         if size_str.endswith("G"):
-            num = float(size_str[:-1])
-            return int(num * 1024 ** 3)
-        elif size_str.endswith("M"):
-            num = float(size_str[:-1])
-            return int(num * 1024 ** 2)
-        elif size_str.endswith("K"):
-            num = float(size_str[:-1])
-            return int(num * 1024)
-        else:
-            # 默认当成字节
-            return int(float(size_str))
+            return int(float(size_str[:-1]) * 1024 ** 3)
+        if size_str.endswith("M"):
+            return int(float(size_str[:-1]) * 1024 ** 2)
+        if size_str.endswith("K"):
+            return int(float(size_str[:-1]) * 1024)
+        return int(float(size_str))
 
-    # 1.2 GET DATA SIZE
     def _data_size_get(self) -> int:
-        """
-        返回文件大小（字节），顺便存一下到 self.file_size_bytes
-        """
-        path = Path(self.data_path)
-        if not path.exists():
-            raise FileNotFoundError(f"文件不存在: {self.data_path}")
-        size_bytes = path.stat().st_size
-        self.file_size_bytes = size_bytes
-        return size_bytes
+        p = Path(self.data_path)
+        if not p.exists():
+            raise FileNotFoundError(f"File not found: {self.data_path}")
+        return p.stat().st_size
 
-    # 1.1 Get DATA TYPE
     def _data_type_get(self) -> str:
-        """
-        根据后缀判断文件类型：csv / xlsx / tsv / other
-        """
         suffix = Path(self.data_path).suffix.lower()
         if suffix == ".csv":
-            file_type = "csv"
-        elif suffix in [".xls", ".xlsx"]:
-            file_type = "xlsx"
-        elif suffix in [".tsv", ".txt"]:
-            file_type = "tsv"
-        else:
-            file_type = "other"
+            return "csv"
+        if suffix in [".tsv", ".txt"]:
+            return "tsv"
+        if suffix in [".xls", ".xlsx"]:
+            return "xlsx"
+        return "other"
 
-        self.file_type = file_type
-        if file_type == "other":
-            raise ValueError(f"non expected files: {suffix}，only support csv/xlsx/tsv")
-        return file_type
-    #this function estimate the trunk size of each batch
-    def estimate_chunksize(self, target_size_str="500M", sep=",", sample_rows=100):
+    def estimate_chunksize(self, target_size_str="500M", sep=",", sample_rows=1000) -> int:
         sample_df = pd.read_csv(self.data_path, sep=sep, nrows=sample_rows)
-        sample_size = sample_df.memory_usage(deep=True).sum()
-        per_row_bytes = sample_size / sample_rows
+        sample_bytes = sample_df.memory_usage(deep=True).sum()
+        per_row = sample_bytes / max(sample_rows, 1)
         target_bytes = self._parse_size_str(target_size_str)
-        chunksize= int(target_bytes / per_row_bytes)
+        chunksize = max(int(target_bytes / per_row), 1)
         return chunksize
 
-
-
-
-
-
-
-    def _load_csv_or_tsv(
-        self,
-        sep: str = ",",
-    ) -> pd.DataFrame:
+    def _estimate_nrows_for_target_bytes(self, target_bytes: int, read_fn, **read_kwargs) -> int:
         """
-        根据文件大小规则加载 csv/tsv 文件：
-        - <=500M: 一次性加载
-        - 500M~10G: 分批读取，再 concat
-        - >10G: 仅加载大约 500M 的数据（通过 sample 估算行数）
+        用 sample 估算每行占用字节数，从而估算 nrows，使读取量约等于 target_bytes。
+        read_fn: pd.read_csv 或 pd.read_excel
         """
+        sample_rows = 5000
+        sample_df = read_fn(nrows=sample_rows, **read_kwargs)
+        per_row = sample_df.memory_usage(deep=True).sum() / max(sample_rows, 1)
+        nrows = max(int(target_bytes / per_row), 1)
+        return nrows
+
+    def loader(self, sep: str = ",") -> pd.DataFrame:
+        """
+       
+        - csv/tsv: 支持 chunksize 分块；>10G 只读约 500M
+        - xlsx: pd.read_excel 无 chunksize；>500M 时退化为只读约 500M（按 nrows 估算）
+        """
+        file_type = self._data_type_get()
+        if file_type == "other":
+            raise ValueError("Unsupported file type. Only csv/tsv/xlsx supported.")
+
         size_bytes = self._data_size_get()
         one_batch_limit = self._parse_size_str(self.allow_data_size_one_batch)
         max_size = self._parse_size_str(self.max_data_size)
         filename = os.path.basename(self.data_path)
 
-        # 1）小于等于 500M，一次性加载
+        # ---- 选择读取函数 ----
+        if file_type in ["csv", "tsv"]:
+            used_sep = "\t" if file_type == "tsv" else sep
+            read_fn = lambda **kw: pd.read_csv(self.data_path, sep=used_sep, **kw)
+            can_chunk = True
+        else:  # xlsx
+            read_fn = lambda **kw: pd.read_excel(self.data_path, **kw)
+            can_chunk = False
+
+        # ---- <= 500M：直接读 ----
         if size_bytes <= one_batch_limit:
             print(f"[INFO] File: {filename}, size: {size_bytes/1024/1024:.2f} MB, loaded all at once")
-            df = pd.read_csv(self.data_path, sep=sep)
-            return df
+            return read_fn()
 
-        # 2）500M ~ 10G，分批加载（但是最后还是会 concat 成一个 DataFrame）
+        # ---- 500M ~ 10G：csv/tsv 可 chunk；xlsx 只能退化为读部分 ----
         if size_bytes <= max_size:
-            print(f"[INFO] File: {filename}, size: {size_bytes/1024/1024:.2f} MB, loaded all at once")
-            chunksize = self.estimate_chunksize(target_size_str=self.allow_data_size_one_batch)
+            if can_chunk:
+                print(f"[INFO] File: {filename}, size: {size_bytes/1024/1024:.2f} MB, loading in chunks then concat")
+                chunksize = self.estimate_chunksize(target_size_str=self.allow_data_size_one_batch,
+                                                   sep=("\t" if file_type == "tsv" else sep))
+                chunks = []
+                for chunk in read_fn(chunksize=chunksize):
+                    chunks.append(chunk)
+                    print(f"[INFO] loaded {len(chunks)} chunk(s), rows so far: {sum(len(c) for c in chunks)}")
+                return pd.concat(chunks, ignore_index=True)
+            else:
+                # Excel：不能 chunk，只能读“约 500M”行数
+                print(f"[WARN] File: {filename} is Excel; pandas read_excel has no chunksize. "
+                      f"Falling back to load ~{self.allow_data_size_one_batch} only.")
+                nrows = self._estimate_nrows_for_target_bytes(one_batch_limit, read_fn)
+                print(f"[INFO] estimated nrows ~ {nrows:,} for ~{self.allow_data_size_one_batch}")
+                return read_fn(nrows=nrows)
 
-            chunks = []
-            # 这里 chunksize 可以根据需要调大/调小
-            for chunk in pd.read_csv(self.data_path, sep=sep, chunksize=chunksize):
-                chunks.append(chunk)
-                print(f"[INFO] 已加载 {len(chunks)} 个 chunk，当前总行数：{sum(len(c) for c in chunks)}")
-            df = pd.concat(chunks, ignore_index=True)
-            return df
+        # ---- > 10G：只读前 500M（csv/tsv/xlsx 都按 nrows 估算）----
+        print(f"[WARN] File: {filename}, size > {self.max_data_size}. Load only ~{self.allow_data_size_one_batch}.")
 
-        # 3）> 10G，只加载大约 500M
-        print(f"[WARN] 文件大小 > {max_size/1024/1024/1024:.1f} GB，仅加载约 500M 数据进行分析。")
-
-        # 先读取一小部分 sample，估算每行大概占多少字节
-        sample_rows = 10_000
-        sample_df = pd.read_csv(self.data_path, sep=sep, nrows=sample_rows)
-        per_row_bytes = sample_df.memory_usage(deep=True).sum() / sample_rows
-        target_bytes = one_batch_limit
-        n_rows_500M = int(target_bytes / per_row_bytes)
-
-        print(
-            f"[INFO] sample 每行约 {per_row_bytes:.1f} 字节，"
-            f"预计加载行数 ~ {n_rows_500M:,} 行。"
-        )
-
-        df = pd.read_csv(self.data_path, sep=sep, nrows=n_rows_500M)
-        return df
-
-    def _load_excel(self) -> pd.DataFrame:
-      
-        
-        size_bytes = self._data_size_get()
-        print(f"[INFO] Excel 文件大小 {size_bytes/1024/1024:.2f} MB，loaded it all at once")
-        df = pd.read_excel(self.data_path)
-        return df
-
-    # 1.3 data -> DataFrame
-    def loader(self) -> pd.DataFrame:
-        file_type = self._data_type_get()
-
-        if file_type == "csv":
-            return self._load_csv_or_tsv(sep=",")
-        elif file_type == "tsv":
-            # tsv 
-            return self._load_csv_or_tsv(sep="\t")
-        elif file_type == "xlsx":
-            return self._load_excel()
-        else:
-            
-            raise ValueError(f"不支持的文件类型: {file_type}")
-
+        nrows = self._estimate_nrows_for_target_bytes(one_batch_limit, read_fn)
+        print(f"[INFO] estimated nrows ~ {nrows:,} for ~{self.allow_data_size_one_batch}")
+        return read_fn(nrows=nrows)
 
 class DataBasicAnalysis:
     def __init__(self, data: pd.DataFrame):
@@ -248,6 +204,8 @@ class DataBasicAnalysis:
                 # ---------- numeric: 判断 discrete / continuous ----------
                 if num_unique <= 15 or (not np.isnan(unique_ratio) and unique_ratio < 0.05):
                     numeric_type = "discrete"
+                elif (not np.isnan(unique_ratio) and unique_ratio > 0.9) and num_unique > 50:
+                        numeric_type = "id"
                 else:
                     numeric_type = "continuous"
 
@@ -275,8 +233,6 @@ class DataBasicAnalysis:
                 {
                     "column": col,
                     "dtype": str(dtype),
-                    "is_numeric": is_numeric,
-                    "is_datetime": is_datetime,
                     "n_unique": num_unique,
                     "unique_ratio": unique_ratio,
                     "numeric_type": numeric_type,
@@ -285,7 +241,10 @@ class DataBasicAnalysis:
                 }
             )
 
-        return pd.DataFrame(infos)
+        df = pd.DataFrame(infos)
+        df["unique_ratio"] = df["unique_ratio"].round(2)
+        return df
+
 
     # 2.3 missing info
     def data_missing_info(self) -> pd.DataFrame:
@@ -295,7 +254,7 @@ class DataBasicAnalysis:
         df = self.data
         n_rows = len(df)
         missing_count = df.isnull().sum()
-        missing_ratio = missing_count / n_rows * 100 if n_rows > 0 else np.nan
+        missing_ratio = (missing_count / n_rows * 100).round(2)if n_rows > 0 else np.nan
 
         res = pd.DataFrame(
             {
@@ -319,7 +278,8 @@ class DataBasicAnalysis:
             s = df[col]
             n_unique = s.nunique(dropna=False)
             dup_count = max(n_rows - n_unique, 0)
-            dup_ratio = dup_count / n_rows * 100 if n_rows > 0 else np.nan
+            dup_ratio = round(dup_count / n_rows * 100, 2) if n_rows > 0 else np.nan
+
             records.append(
                 {
                     "column": col,
@@ -338,6 +298,8 @@ class DataBasicAnalysis:
             return pd.DataFrame()
 
         desc = self.data[cont_cols].describe(percentiles=[0.25, 0.5, 0.75]).T
+        desc = desc.round(2)
+
         desc = desc.rename_axis("column").reset_index()
         desc = desc.rename(
             columns={
@@ -372,7 +334,7 @@ class DataBasicAnalysis:
         for col in cat_cols:
             s = self.data[col]
             vc = s.value_counts(dropna=False).head(top_n)
-            ratio = vc / n_rows * 100 if n_rows > 0 else np.nan
+            ratio = (vc / n_rows * 100).round(2) if n_rows > 0 else np.nan
 
             df_stat = pd.DataFrame(
                 {
@@ -408,29 +370,52 @@ if __name__ == "__main__":
     print("-" * 40)
 
     # 2. 对 train 做基础分析
-    analyzer = DataBasicAnalysis(train_df)
+    def run_basic_eda( df: pd.DataFrame, top_n: int = 10, show: bool = True) -> dict:
+       
+    
+   
 
-    print("\n=== 数据形状 ===")
-    print(analyzer.data_size_info())
+        """
+    对 DataFrame 运行基础 EDA 分析
 
-    print("\n=== 列信息 ===")
-    print(analyzer.data_column_info())
+    Returns:
+        dict 包含所有分析结果，方便后续保存 / 导出 / 单元测试
+        """
+        analyzer = DataBasicAnalysis(df)
 
-    print("\n=== 缺失值分析 ===")
-    print(analyzer.data_missing_info())
+        results = {}
 
-    print("\n=== 重复值分析 ===")
-    print(analyzer.data_duplicate_info())
+        results["data_shape"] = analyzer.data_size_info()
+        results["column_info"] = analyzer.data_column_info()
+        results["missing_info"] = analyzer.data_missing_info()
+        results["duplicate_info"] = analyzer.data_duplicate_info()
+        results["numeric_info"] = analyzer.data_numeric_info()
+        results["categorical_info"] = analyzer.data_categorical_info(top_n=top_n)
 
-    print("\n=== 连续型变量统计 ===")
-    print(analyzer.data_numeric_info())
+        if show:
+            print("\n=== 数据形状 ===")
+            print(results["data_shape"])
 
-    print("\n=== 离散型变量统计（每列 top 20） ===")
-    cat_info = analyzer.data_categorical_info(top_n=10)
-    for col, df_cat in cat_info.items():
-        print(f"\n[Column: {col}]")
-        print(df_cat)
+            print("\n=== 列信息 ===")
+            print(results["column_info"])
 
+            print("\n=== 缺失值分析 ===")
+            print(results["missing_info"])
+
+            print("\n=== 重复值分析 ===")
+            print(results["duplicate_info"])
+
+            print("\n=== 连续型变量统计 ===")
+            print(results["numeric_info"])
+
+            print(f"\n=== 离散型变量统计（每列 top {top_n}） ===")
+        for col, df_cat in results["categorical_info"].items():
+            print(f"\n[Column: {col}]")
+            print(df_cat)
+
+        return results
+
+    result = run_basic_eda(train_df)
 
 
 
